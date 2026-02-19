@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="AnkiClone" />
+  <title>🧠 AnkiClone</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap" rel="stylesheet" />
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0f172a; font-family: 'Noto Sans JP', 'Helvetica Neue', sans-serif; -webkit-tap-highlight-color: transparent; }
+    #root { max-width: 420px; margin: 0 auto; min-height: 100vh; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React CDN（ビルド不要） -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── SM-2 アルゴリズム ─────────────────────────────
+const SM2 = {
+  defaultCard: () => ({ ef: 2.5, interval: 0, reps: 0, due: Date.now(), lastReviewed: null, history: [] }),
+  review(card, quality) {
+    const q = [1, 2, 4, 5][quality];
+    let { ef, interval, reps } = card;
+    if (q < 3) { reps = 0; interval = 1; }
+    else {
+      if (reps === 0) interval = 1;
+      else if (reps === 1) interval = 6;
+      else interval = Math.round(interval * ef);
+      reps += 1;
+    }
+    ef = Math.max(1.3, ef + 0.1 - (5 - q) * (0.08 + (5 - q) * 0.02));
+    const now = Date.now();
+    return { ...card, ef, interval, reps, lastReviewed: now, due: now + interval * 86400000, history: [...(card.history||[]), { date: now, quality: q }] };
+  },
+  isDue(card) { return card.due <= Date.now(); }
+};
+
+// ── TSVパーサー ────────────────────────────────────
+function parseTSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const cards = [];
+  for (const line of lines) {
+    if (!line.trim() || line.startsWith("#")) continue;
+    const cols = line.split("\t");
+    if (cols.length >= 2) cards.push({ front: cols[0].trim(), back: cols[1].trim(), tags: cols[2]?.trim() || "" });
+  }
+  return cards;
+}
+
+// ── 忘却曲線グラフ ─────────────────────────────────
+function CurveChart({ ef = 2.5, interval = 0 }) {
+  const w = 260, h = 90;
+  const pts = Array.from({ length: 31 }, (_, d) => {
+    const r = Math.max(0, Math.exp(-d / (ef * 5)) * 100);
+    return `${(d / 30) * w},${h - (r / 100) * h}`;
+  }).join(" ");
+  const ri = Math.max(0, Math.exp(-interval / (ef * 5)) * 100);
+  return (
+    <svg width="100%" viewBox={`0 0 ${w} ${h}`} style={{ overflow: "visible" }}>
+      <defs>
+        <linearGradient id="cg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.4" />
+          <stop offset="100%" stopColor="#f59e0b" stopOpacity="0.02" />
+        </linearGradient>
+      </defs>
+      <polygon points={`0,${h} ${pts} ${w},${h}`} fill="url(#cg)" />
+      <polyline points={pts} fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" />
+      {interval > 0 && (<>
+        <line x1={(interval/30)*w} y1="0" x2={(interval/30)*w} y2={h} stroke="#60a5fa" strokeWidth="1.5" strokeDasharray="3,3" />
+        <circle cx={(interval/30)*w} cy={h-(ri/100)*h} r="4" fill="#60a5fa" />
+      </>)}
+      <text x="2" y="10" fontSize="9" fill="#94a3b8">100%</text>
+      <text x="2" y={h-2} fontSize="9" fill="#94a3b8">0%</text>
+      <text x={w-20} y={h-2} fontSize="9" fill="#94a3b8">30d</text>
+    </svg>
+  );
+}
+
+// ── localStorage ──────────────────────────────────
+const KEY = "anki_deck";
+const loadDeck = () => { try { const r = localStorage.getItem(KEY); return r ? JSON.parse(r) : []; } catch(_) { return []; } };
+const savToLS  = (d) => { try { localStorage.setItem(KEY, JSON.stringify(d)); } catch(_) {} };
+
+// ── メインアプリ ──────────────────────────────────
+function App() {
+  const [deck, setDeck] = useState([]);
+  const [screen, setScreen] = useState("home");
+  const [queue, setQueue] = useState([]);
+  const [idx, setIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [flipping, setFlipping] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importMsg, setImportMsg] = useState("");
+  const [stats, setStats] = useState({ again:0, hard:0, good:0, easy:0 });
+  const fileRef = useRef(null);
+
+  useEffect(() => { setDeck(loadDeck()); }, []);
+
+  const save = (d) => { setDeck(d); savToLS(d); };
+
+  const due = deck.filter(c => SM2.isDue(c));
+  const learned = deck.filter(c => c.reps > 0);
+
+  const startStudy = () => {
+    const q = deck.map((c,i) => ({...c, _i:i})).filter(c => SM2.isDue(c));
+    if (!q.length) return;
+    setQueue(q); setIdx(0); setFlipped(false);
+    setStats({again:0,hard:0,good:0,easy:0}); setScreen("study");
+  };
+
+  const flip = () => {
+    if (flipped || flipping) return;
+    setFlipping(true);
+    setTimeout(() => { setFlipped(true); setFlipping(false); }, 150);
+  };
+
+  const grade = (q) => {
+    const card = queue[idx];
+    const updated = SM2.review({...deck[card._i]}, q);
+    const nd = [...deck]; nd[card._i] = updated; save(nd);
+    const labels = ["again","hard","good","easy"];
+    setStats(s => ({...s, [labels[q]]: s[labels[q]]+1}));
+    if (idx+1 >= queue.length) setScreen("done");
+    else { setFlipped(false); setIdx(idx+1); }
+  };
+
+  const handleImport = (text) => {
+    const parsed = parseTSV(text);
+    if (!parsed.length) { setImportMsg("⚠️ カードが見つかりません。TSV形式（表タブ裏）を確認してください。"); return; }
+    save([...deck, ...parsed.map(c => ({...c, id: Date.now()+Math.random(), ...SM2.defaultCard()}))]);
+    setImportMsg(`✅ ${parsed.length}枚インポートしました！`);
+    setImportText("");
+    setTimeout(() => { setImportMsg(""); setScreen("home"); }, 1800);
+  };
+
+  const handleFile = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => handleImport(ev.target.result);
+    reader.readAsText(file, "UTF-8");
+    e.target.value = "";
+  };
+
+  const resetDeck = () => { if (!confirm("すべてのカードを削除しますか？")) return; save([]); setScreen("home"); };
+
+  // スタイル定数
+  const C = { bg:"#0f172a", sf:"#1e293b", sf2:"#273549", ac:"#f59e0b", acD:"#92400e", bl:"#60a5fa", gr:"#4ade80", tx:"#f1f5f9", mu:"#64748b", bo:"#334155" };
+  const wrap = { background:C.bg, minHeight:"100vh", fontFamily:"'Noto Sans JP','Helvetica Neue',sans-serif", color:C.tx };
+  const card = (x={}) => ({ background:C.sf, borderRadius:16, padding:"20px", border:`1px solid ${C.bo}`, ...x });
+  const btn  = (bg, color="#000", x={}) => ({ background:bg, color, border:"none", borderRadius:12, padding:"12px 0", fontSize:15, fontWeight:700, cursor:"pointer", ...x });
+  const topBar = (title, back) => (
+    <div style={{display:"flex",alignItems:"center",padding:"16px 20px 8px",gap:12}}>
+      {back && <button onClick={()=>setScreen(back)} style={{background:"none",border:"none",color:C.ac,fontSize:24,cursor:"pointer",padding:0}}>‹</button>}
+      <span style={{fontSize:20,fontWeight:800,color:C.ac}}>{title}</span>
+    </div>
+  );
+
+  // ── ホーム ──────────────────────────────────────
+  if (screen === "home") return (
+    <div style={wrap}>
+      <div style={{padding:"24px 20px 12px",background:`linear-gradient(180deg,#1a2744 0%,${C.bg} 100%)`}}>
+        <div style={{fontSize:11,color:C.mu,fontWeight:600,letterSpacing:2,textTransform:"uppercase",marginBottom:4}}>Spaced Repetition</div>
+        <div style={{fontSize:26,fontWeight:900,color:C.ac,letterSpacing:-1}}>🧠 AnkiClone</div>
+      </div>
+      <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:12}}>
+        <div style={card()}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:12}}>
+            {[{l:"合計",v:deck.length,c:C.tx},{l:"学習済",v:learned.length,c:C.gr},{l:"今日の復習",v:due.length,c:C.ac}].map(s=>(
+              <div key={s.l} style={{textAlign:"center",background:C.sf2,borderRadius:10,padding:"10px 4px"}}>
+                <div style={{fontSize:22,fontWeight:800,color:s.c}}>{s.v}</div>
+                <div style={{fontSize:10,color:C.mu,marginTop:2}}>{s.l}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{fontSize:10,color:C.mu,marginBottom:4}}>📉 エビングハウス忘却曲線</div>
+          <CurveChart ef={2.5} interval={0} />
+        </div>
+
+        <button onClick={startStudy} disabled={due.length===0} style={{...btn(due.length>0?C.ac:C.bo,due.length>0?"#000":C.mu),width:"100%",padding:"16px",fontSize:17,borderRadius:14,opacity:due.length>0?1:0.5}}>
+          {due.length>0 ? `▶ 復習開始（${due.length}枚）` : "✓ 今日の復習は完了！"}
+        </button>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <button onClick={()=>setScreen("import")} style={{...btn(C.sf2,C.tx),padding:"14px",borderRadius:12,fontSize:14}}>📂 TSVインポート</button>
+          <button onClick={()=>setScreen("stats")}  style={{...btn(C.sf2,C.tx),padding:"14px",borderRadius:12,fontSize:14}}>📊 統計</button>
+        </div>
+
+        {deck.length > 0 && (
+          <div style={card()}>
+            <div style={{fontSize:12,color:C.mu,marginBottom:8,fontWeight:700}}>最近追加したカード</div>
+            {deck.slice(-5).reverse().map((c,i)=>(
+              <div key={i} style={{padding:"8px 0",borderBottom:`1px solid ${C.bo}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"60%"}} dangerouslySetInnerHTML={{__html: c.front.replace(/<br\s*\/?>/gi," ")}} />
+                <span style={{fontSize:10,padding:"2px 8px",borderRadius:20,background:c.reps===0?C.acD:c.reps<3?"#1e3a5f":"#14532d",color:c.reps===0?C.ac:c.reps<3?C.bl:C.gr}}>
+                  {c.reps===0?"新規":`${c.interval}日`}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+        <button onClick={resetDeck} style={{...btn("transparent",C.mu),fontSize:12,padding:"8px"}}>🗑 デッキをリセット</button>
+      </div>
+    </div>
+  );
+
+  // ── 学習 ────────────────────────────────────────
+  if (screen === "study") {
+    const c = queue[idx];
+    const dc = deck[c._i];
+    return (
+      <div style={wrap}>
+        {topBar(`${idx+1} / ${queue.length}`, null)}
+        <div style={{margin:"0 20px",height:4,background:C.bo,borderRadius:2}}>
+          <div style={{height:"100%",width:`${(idx/queue.length)*100}%`,background:C.ac,borderRadius:2,transition:"width 0.4s"}} />
+        </div>
+        <div style={{padding:"16px"}}>
+          <div onClick={flip} style={{...card({minHeight:220,display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",cursor:"pointer",position:"relative",overflow:"hidden"}),background:"linear-gradient(135deg,#1e293b 0%,#273549 100%)",transform:flipping?"scale(0.97)":"scale(1)",transition:"transform 0.15s ease",userSelect:"none"}}>
+            {c.tags && <div style={{position:"absolute",top:12,left:12,fontSize:10,color:C.mu,background:C.sf,padding:"2px 8px",borderRadius:20}}>{c.tags}</div>}
+            <div style={{position:"absolute",top:12,right:12,fontSize:10,color:C.bl}}>{dc.reps>0?`📅 ${dc.interval}日→?`:"🆕 新規"}</div>
+            <div style={{fontSize:18,fontWeight:800,textAlign:"center",lineHeight:1.6,padding:"8px"}} dangerouslySetInnerHTML={{__html:c.front}} />
+            {flipped && (
+              <div style={{marginTop:16,paddingTop:16,borderTop:`1px solid ${C.bo}`,width:"100%",textAlign:"center"}}>
+                <div style={{fontSize:11,color:C.mu,marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>答え</div>
+                <div style={{fontSize:17,color:C.gr,fontWeight:600,lineHeight:1.6}} dangerouslySetInnerHTML={{__html:c.back}} />
+              </div>
+            )}
+            {!flipped && <div style={{marginTop:20,color:C.mu,fontSize:12}}>タップしてめくる</div>}
+          </div>
+
+          {flipped && (
+            <div style={{...card({marginTop:12,padding:"12px 14px"})}}>
+              <div style={{fontSize:10,color:C.mu,marginBottom:4}}>現在の記憶保持率と忘却曲線</div>
+              <CurveChart ef={dc.ef} interval={Math.min(dc.interval,30)} />
+            </div>
+          )}
+
+          {flipped && (
+            <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8}}>
+              {[
+                {label:"Again",sub:"1日",  bg:"#7f1d1d",color:"#fca5a5",q:0},
+                {label:"Hard", sub:"3日",  bg:"#78350f",color:"#fcd34d",q:1},
+                {label:"Good", sub:`${Math.round(dc.interval*dc.ef)||6}日`, bg:"#14532d",color:"#86efac",q:2},
+                {label:"Easy", sub:`${Math.round(dc.interval*dc.ef*1.3)||10}日`,bg:"#1e3a5f",color:"#93c5fd",q:3},
+              ].map(b=>(
+                <button key={b.q} onClick={()=>grade(b.q)} style={{background:b.bg,color:b.color,border:"none",borderRadius:12,padding:"12px 0",cursor:"pointer",textAlign:"center"}}>
+                  <div style={{fontSize:12,fontWeight:800}}>{b.label}</div>
+                  <div style={{fontSize:10,opacity:0.7,marginTop:2}}>{b.sub}</div>
+                </button>
+              ))}
+            </div>
+          )}
+          <button onClick={()=>setScreen("home")} style={{...btn("transparent",C.mu),width:"100%",marginTop:12,fontSize:12}}>終了して戻る</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── 完了 ────────────────────────────────────────
+  if (screen === "done") return (
+    <div style={wrap}>
+      <div style={{padding:"40px 20px",textAlign:"center"}}>
+        <div style={{fontSize:60}}>🎉</div>
+        <div style={{fontSize:26,fontWeight:900,color:C.ac,marginTop:12}}>セッション完了！</div>
+        <div style={{fontSize:14,color:C.mu,marginTop:8}}>おつかれさまでした</div>
+        <div style={{...card({marginTop:24,display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,padding:"16px"})}}>
+          {[{l:"Again",v:stats.again,c:"#f87171"},{l:"Hard",v:stats.hard,c:"#fcd34d"},{l:"Good",v:stats.good,c:"#4ade80"},{l:"Easy",v:stats.easy,c:"#93c5fd"}].map(s=>(
+            <div key={s.l} style={{textAlign:"center"}}>
+              <div style={{fontSize:22,fontWeight:800,color:s.c}}>{s.v}</div>
+              <div style={{fontSize:10,color:C.mu}}>{s.l}</div>
+            </div>
+          ))}
+        </div>
+        <button onClick={()=>setScreen("home")} style={{...btn(C.ac,"#000"),width:"100%",marginTop:20,padding:"16px",borderRadius:14}}>ホームに戻る</button>
+      </div>
+    </div>
+  );
+
+  // ── インポート ───────────────────────────────────
+  if (screen === "import") return (
+    <div style={wrap}>
+      {topBar("TSVインポート","home")}
+      <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:12}}>
+        <div style={card()}>
+          <div style={{fontSize:12,color:C.mu,marginBottom:8}}>📋 TSVフォーマット（タブ区切り）</div>
+          <div style={{fontFamily:"monospace",fontSize:12,background:C.sf2,padding:10,borderRadius:8,color:C.gr,lineHeight:1.8}}>
+            apple	林檎	英語<br/>
+            光合成	photosynthesis	生物<br/>
+            Q1. 問題文	イ. 正解の選択肢	資格
+          </div>
+          <div style={{fontSize:11,color:C.mu,marginTop:8}}>・3列目（タグ）は省略可能<br/>・#で始まる行はスキップ</div>
+        </div>
+
+        <button onClick={()=>fileRef.current?.click()} style={{...btn(C.bl,"#000"),width:"100%",padding:"14px",borderRadius:12,fontSize:14}}>
+          📂 TSVファイルを選択
+        </button>
+        <input ref={fileRef} type="file" accept=".tsv,.txt,.csv" style={{display:"none"}} onChange={handleFile} />
+
+        <div style={{fontSize:12,color:C.mu,textAlign:"center"}}>または直接貼り付け</div>
+        <textarea
+          value={importText}
+          onChange={e=>setImportText(e.target.value)}
+          placeholder={"apple\t林檎\n光合成\tphotosynthesis"}
+          style={{width:"100%",minHeight:120,background:C.sf2,border:`1px solid ${C.bo}`,borderRadius:12,padding:"12px",color:C.tx,fontSize:13,fontFamily:"monospace",resize:"vertical",boxSizing:"border-box"}}
+        />
+        <button onClick={()=>handleImport(importText)} disabled={!importText.trim()} style={{...btn(C.ac,"#000"),width:"100%",padding:"14px",borderRadius:12,opacity:importText.trim()?1:0.4}}>
+          インポート
+        </button>
+        {importMsg && <div style={{textAlign:"center",fontSize:14,color:importMsg.startsWith("✅")?C.gr:"#fca5a5",padding:12}}>{importMsg}</div>}
+      </div>
+    </div>
+  );
+
+  // ── 統計 ────────────────────────────────────────
+  if (screen === "stats") {
+    const avgEf = deck.length>0 ? (deck.reduce((s,c)=>s+c.ef,0)/deck.length).toFixed(2) : 0;
+    const totalReps = deck.reduce((s,c)=>s+(c.history?.length||0),0);
+    return (
+      <div style={wrap}>
+        {topBar("統計・分析","home")}
+        <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:12}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            {[
+              {l:"合計レビュー数",v:totalReps,c:C.tx},
+              {l:"平均EF",v:avgEf,c:C.ac},
+              {l:"新規カード",v:deck.filter(c=>c.reps===0).length,c:C.bl},
+              {l:"マスター済(7日↑)",v:deck.filter(c=>c.interval>=7).length,c:C.gr},
+            ].map(s=>(
+              <div key={s.l} style={{...card({textAlign:"center",padding:"14px 8px"})}}>
+                <div style={{fontSize:26,fontWeight:900,color:s.c}}>{s.v}</div>
+                <div style={{fontSize:11,color:C.mu,marginTop:4}}>{s.l}</div>
+              </div>
+            ))}
+          </div>
+          <div style={card()}>
+            <div style={{fontSize:12,color:C.ac,fontWeight:700,marginBottom:8}}>📉 忘却曲線</div>
+            <CurveChart ef={Number(avgEf)||2.5} interval={7} />
+            <div style={{fontSize:10,color:C.bl,marginTop:4}}>青い点線 = 7日後の復習タイミング</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<!-- PWA Service Worker -->
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    // インラインSW（外部ファイル不要）
+    const sw = `
+      const CACHE = "anki-v1";
+      self.addEventListener("install", e => {
+        self.skipWaiting();
+      });
+      self.addEventListener("activate", e => {
+        self.clients.claim();
+      });
+      self.addEventListener("fetch", e => {
+        e.respondWith(
+          caches.match(e.request).then(r => r || fetch(e.request).then(res => {
+            return res;
+          }))
+        );
+      });
+    `;
+    const blob = new Blob([sw], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    navigator.serviceWorker.register(url).catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
